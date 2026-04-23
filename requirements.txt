@@ -1,0 +1,6 @@
+fastapi==0.115.2
+uvicorn[standard]==0.32.0
+langgraph==0.2.39
+langchain-aws==0.2.5
+pydantic==2.9.2
+boto3==1.35.36
