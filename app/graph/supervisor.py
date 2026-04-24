@@ -1,107 +1,113 @@
-from typing import TypedDict
-
 from langgraph.graph import END
 from langgraph.graph import StateGraph
 
+from app.graph.nodes.event_analysis import event_analysis_agent_node
+from app.graph.nodes.guide import guide_generation_agent_node
+from app.graph.nodes.sap_status import sap_status_check_agent_node
+from app.graph.nodes.supervisor import supervisor_agent_node
+from app.graph.nodes.tools import event_analysis_tool_node
+from app.graph.nodes.tools import guide_generation_tool_node
+from app.graph.nodes.tools import sap_status_check_tool_node
+from app.graph.state import WorkflowState
 from app.models.alerts import AlertPayload
 from app.models.alerts import Escalation
 from app.models.alerts import SupervisorResponse
-from app.services.bedrock import BedrockService
 
 
-class SupervisorState(TypedDict, total=False):
-    alert: AlertPayload
-    category: str
-    status: str
-    business_impact: str
-    severity_assessment: str
-    suspected_root_cause: str
-    confidence: float
-    evidence: list[str]
-    missing_information: list[str]
-    recommended_actions: list[str]
-    sap_tcodes: list[str]
-    escalation: dict
-    operator_summary: str
+def route_after_event_analysis(state: WorkflowState) -> str:
+    if not state.get("event_analysis_tool_completed", False):
+        return "event_analysis_tool"
+    return "supervisor_agent"
 
 
-async def analyze_event(state: SupervisorState) -> SupervisorState:
-    alert = state["alert"]
-    category = "performance" if "response time" in alert.raw_message.lower() else "general"
+def route_after_supervisor_review(state: WorkflowState) -> str:
+    current_stage = state.get("current_stage", "event_analysis")
+    guide_review_count = state.get("guide_review_count", 0)
+    max_review_count = state.get("max_guide_review_count", 3)
 
-    return {
-        "category": category,
-        "status": "suspected",
-        "business_impact": (
-            f"{alert.system_context.business_service or 'core SAP service'} may be affected"
-        ),
-        "severity_assessment": alert.severity,
-        "suspected_root_cause": "Initial symptom detected from monitoring alert",
-        "confidence": 0.62,
-        "evidence": [
-            f"Alert source: {alert.source}",
-            f"Alert severity: {alert.severity}",
-            f"Original message: {alert.raw_message}",
-        ],
-        "missing_information": ["Current SAP runtime validation results"],
-    }
+    if current_stage == "sap_status":
+        return "sap_status_agent"
+    if current_stage == "guide_generation":
+        return "guide_generation_agent"
+    if current_stage == "guide_quality_review":
+        if guide_review_count >= max_review_count or state.get(
+            "guide_quality_approved",
+            False,
+        ):
+            return END
+        return "guide_generation_agent"
+    if current_stage == "completed":
+        return END
+    return "event_analysis_agent"
 
 
-async def validate_sap(state: SupervisorState) -> SupervisorState:
-    alert = state["alert"]
-    needs_escalation = alert.severity in {"high", "critical"}
+def route_after_sap_status_check(state: WorkflowState) -> str:
+    if not state.get("sap_status_tool_completed", False):
+        return "sap_status_tool"
+    return "supervisor_agent"
 
-    return {
-        "status": "suspected",
-        "confidence": 0.74 if needs_escalation else 0.68,
-        "evidence": [
-            *state["evidence"],
-            "Runtime SAP validation is mocked in this initial scaffold",
-        ],
-        "recommended_actions": [
-            "Check current SAP work process status",
-            "Review recent logs and dumps before taking corrective action",
-            "Validate whether business transactions are failing",
-        ],
-        "sap_tcodes": ["SM50", "ST03N"] if state["category"] == "performance" else ["SM21"],
-        "escalation": {
-            "required": needs_escalation,
-            "target": "SAP Basis L2" if needs_escalation else "",
-            "reason": "High-severity production alert requires human review"
-            if needs_escalation
-            else "",
+
+def route_after_guide_generation(state: WorkflowState) -> str:
+    if not state.get("guide_generation_tool_completed", False):
+        return "guide_generation_tool"
+    return "supervisor_agent"
+
+
+def build_supervisor_workflow():
+    workflow = StateGraph(WorkflowState)
+    workflow.add_node("supervisor_agent", supervisor_agent_node)
+    workflow.add_node("event_analysis_agent", event_analysis_agent_node)
+    workflow.add_node("event_analysis_tool", event_analysis_tool_node)
+    workflow.add_node("sap_status_agent", sap_status_check_agent_node)
+    workflow.add_node("sap_status_tool", sap_status_check_tool_node)
+    workflow.add_node("guide_generation_agent", guide_generation_agent_node)
+    workflow.add_node("guide_generation_tool", guide_generation_tool_node)
+
+    workflow.set_entry_point("supervisor_agent")
+    workflow.add_conditional_edges(
+        "supervisor_agent",
+        route_after_supervisor_review,
+        {
+            "event_analysis_agent": "event_analysis_agent",
+            "sap_status_agent": "sap_status_agent",
+            "guide_generation_agent": "guide_generation_agent",
+            END: END,
         },
-    }
-
-
-async def build_operator_guide(state: SupervisorState) -> SupervisorState:
-    bedrock = BedrockService()
-    summary = await bedrock.summarize(
-        f"Create a concise operator summary for alert {state['alert'].alert_id}"
     )
 
-    return {
-        "operator_summary": (
-            f"{state['alert'].sid} alert categorized as {state['category']}. "
-            f"Immediate action: {state['recommended_actions'][0]}. "
-            f"{summary}"
-        )
-    }
+    workflow.add_conditional_edges(
+        "event_analysis_agent",
+        route_after_event_analysis,
+        {
+            "event_analysis_tool": "event_analysis_tool",
+            "supervisor_agent": "supervisor_agent",
+        },
+    )
+    workflow.add_edge("event_analysis_tool", "event_analysis_agent")
 
+    workflow.add_conditional_edges(
+        "sap_status_agent",
+        route_after_sap_status_check,
+        {
+            "sap_status_tool": "sap_status_tool",
+            "supervisor_agent": "supervisor_agent",
+        },
+    )
+    workflow.add_edge("sap_status_tool", "sap_status_agent")
 
-def _build_graph():
-    workflow = StateGraph(SupervisorState)
-    workflow.add_node("analyze_event", analyze_event)
-    workflow.add_node("validate_sap", validate_sap)
-    workflow.add_node("build_operator_guide", build_operator_guide)
-    workflow.set_entry_point("analyze_event")
-    workflow.add_edge("analyze_event", "validate_sap")
-    workflow.add_edge("validate_sap", "build_operator_guide")
-    workflow.add_edge("build_operator_guide", END)
+    workflow.add_conditional_edges(
+        "guide_generation_agent",
+        route_after_guide_generation,
+        {
+            "guide_generation_tool": "guide_generation_tool",
+            "supervisor_agent": "supervisor_agent",
+        },
+    )
+    workflow.add_edge("guide_generation_tool", "guide_generation_agent")
     return workflow.compile()
 
 
-graph = _build_graph()
+graph = build_supervisor_workflow()
 
 
 async def run_supervisor(payload: AlertPayload) -> SupervisorResponse:
@@ -113,16 +119,22 @@ async def run_supervisor(payload: AlertPayload) -> SupervisorResponse:
 
     return SupervisorResponse(
         alert_id=payload.alert_id,
-        category=final_state["category"],
-        status=final_state["status"],
-        business_impact=final_state["business_impact"],
-        severity_assessment=final_state["severity_assessment"],
-        suspected_root_cause=final_state["suspected_root_cause"],
-        confidence=final_state["confidence"],
-        evidence=final_state["evidence"],
-        missing_information=final_state["missing_information"],
-        recommended_actions=final_state["recommended_actions"],
-        sap_tcodes=final_state["sap_tcodes"],
+        category=final_state.get("category", "unclassified"),
+        status=final_state.get("status", "insufficient_evidence"),
+        business_impact=final_state.get("business_impact", "Not evaluated yet."),
+        severity_assessment=final_state.get("severity_assessment", payload.severity),
+        suspected_root_cause=final_state.get(
+            "suspected_root_cause",
+            "Not analyzed yet.",
+        ),
+        confidence=final_state.get("confidence", 0.0),
+        evidence=final_state.get("evidence", []),
+        missing_information=final_state.get("missing_information", []),
+        recommended_actions=final_state.get("recommended_actions", []),
+        sap_tcodes=final_state.get("sap_tcodes", []),
         escalation=Escalation(**escalation),
-        operator_summary=final_state["operator_summary"],
+        operator_summary=final_state.get(
+            "operator_summary",
+            "Supervisor workflow finished without generating a live operator summary.",
+        ),
     )

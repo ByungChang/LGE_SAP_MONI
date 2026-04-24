@@ -1,0 +1,9 @@
+{
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "sap_supervisor": "./app/graph/supervisor.py:graph"
+  },
+  "env": ".env"
+}
